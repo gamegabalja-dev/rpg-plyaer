@@ -1,0 +1,132 @@
+name: Build APK
+
+# Builds the debug APK on GitHub's servers. Run it by hand (Actions tab -> "Build APK" -> "Run workflow"),
+# or just push to the repository. Push a tag such as v0.1.0 to also get the APK on the Releases page.
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # only used to attach the APK to a release when a v* tag is pushed
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    name: Debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      # GitHub's web uploader silently drops folders in some situations (dragging out of a zip viewer, phone browsers,
+      # more than 100 files at once). So the whole project can also be uploaded as ONE file: if a zip named
+      # rpg-runner*.zip (for example rpg-runner-0.2.0.zip) is in the repository root, the build uses what is inside it
+      # and ignores every loose file in the repository. Without such a zip nothing changes.
+      - name: Use the project zip if one is in the repository
+        run: |
+          ZIP="$(ls -1 rpg-runner*.zip 2>/dev/null | sort -V | tail -n 1)"
+          if [ -z "$ZIP" ]; then
+            echo "No rpg-runner*.zip in the repository root: building the uploaded files as they are."
+            exit 0
+          fi
+          echo "Building from the project zip: $ZIP"
+          TMP="$RUNNER_TEMP/project-zip"
+          rm -rf "$TMP"
+          mkdir -p "$TMP"
+          unzip -q "$ZIP" -d "$TMP"
+          SETTINGS="$(find "$TMP" -maxdepth 3 -name settings.gradle | head -n 1)"
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::settings.gradle was not found inside $ZIP - is it the project zip?"
+            exit 1
+          fi
+          SRC="$(dirname "$SETTINGS")"
+          # leftovers of older or half-finished uploads must not mix with the zip's files
+          rm -rf app gradle tools dev build.gradle settings.gradle gradle.properties gradlew gradlew.bat
+          cp -a "$SRC"/. .
+          echo "- Built from the project zip \`$ZIP\` (loose project files in the repository were ignored)." >> "$GITHUB_STEP_SUMMARY"
+          ls -la
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # The runner image already contains the Android SDK (ANDROID_HOME) with sdkmanager. The android-actions/setup-android@v3
+      # action asked for the "tools" package, which Google no longer serves ("Failed to find package 'tools'"), and stopped
+      # the build, so the SDK is set up here directly. If the preinstalled sdkmanager is missing or broken, the command-line
+      # tools are downloaded (the same file the action downloaded).
+      - name: Set up the Android SDK
+        run: |
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKM="$(ls -1 "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n 1)"
+          if [ -z "$SDKM" ] || ! "$SDKM" --version > /dev/null 2>&1; then
+            echo "No working sdkmanager in $SDK: downloading the command-line tools"
+            curl -fsSL --retry 4 -o "$RUNNER_TEMP/cmdline-tools.zip" https://dl.google.com/android/repository/commandlinetools-linux-12266719_latest.zip
+            rm -rf "$RUNNER_TEMP/clt"
+            mkdir -p "$RUNNER_TEMP/clt"
+            unzip -q "$RUNNER_TEMP/cmdline-tools.zip" -d "$RUNNER_TEMP/clt"
+            SDKM="$RUNNER_TEMP/clt/cmdline-tools/bin/sdkmanager"
+          fi
+          echo "Using $SDKM (SDK folder $SDK)"
+          mkdir -p "$SDK"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          yes | "$SDKM" --sdk_root="$SDK" --licenses > /dev/null || true
+          "$SDKM" --sdk_root="$SDK" "platform-tools" "platforms;android-35" "build-tools;34.0.0"
+
+      - name: Set up Gradle (caches downloads between runs)
+        uses: gradle/actions/setup-gradle@v4
+
+      # Yume Nikki / RPG Maker 2000+2003 games run through the EasyRPG web player (GPLv3), which is not stored in
+      # this repository. If the download fails the APK is still built; it just cannot run those games itself.
+      - name: Fetch the EasyRPG web player
+        id: easyrpg
+        continue-on-error: true
+        run: sh tools/fetch-easyrpg-web.sh
+
+      - name: Build the debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Collect the APK
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk dist/RPGRunner-debug.apk
+          ls -l dist
+          {
+            echo "### RPG Runner debug APK"
+            echo ""
+            echo "- Size: $(du -h dist/RPGRunner-debug.apk | cut -f1)"
+            if unzip -l dist/RPGRunner-debug.apk | grep -q 'assets/easyrpg/rr-player.html'; then
+              echo "- EasyRPG web player (Yume Nikki / RPG Maker 2000/2003): **included**"
+            else
+              echo "- EasyRPG web player (Yume Nikki / RPG Maker 2000/2003): **not included** (download failed, see the \"Fetch the EasyRPG web player\" step)"
+            fi
+            echo ""
+            echo "Download it below under **Artifacts** (RPGRunner-debug-apk), unzip, and install the .apk on the phone."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RPGRunner-debug-apk
+          path: dist/RPGRunner-debug.apk
+          if-no-files-found: error
+
+      - name: Attach the APK to a release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "RPG Runner $GITHUB_REF_NAME" --notes "Debug-signed build, see README.md."
+          gh release upload "$GITHUB_REF_NAME" dist/RPGRunner-debug.apk --clobber
